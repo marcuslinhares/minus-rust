@@ -1,10 +1,10 @@
 use std::io::Write;
-use std::num::NonZeroU32;
 
 use anyhow::{Error as E, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
+use encoding_rs::Encoding;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -29,9 +29,7 @@ impl EmbeddingEngine {
         let device = Device::Cpu;
         let api = Api::new()?;
         let repo = api.repo(Repo::with_revision(
-            EMBED_MODEL.to_string(),
-            RepoType::Model,
-            "main".into(),
+            EMBED_MODEL.to_string(), RepoType::Model, "main".into(),
         ));
         println!("[embed] Baixando tokenizer...");
         let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
@@ -66,7 +64,7 @@ impl EmbeddingEngine {
 
 struct ChatEngine {
     model: LlamaModel,
-    _backend: LlamaBackend,
+    backend: LlamaBackend,
 }
 
 impl ChatEngine {
@@ -75,50 +73,51 @@ impl ChatEngine {
         println!("[chat] Baixando modelo GGUF...");
         let api = Api::new()?;
         let repo = api.repo(Repo::with_revision(
-            CHAT_REPO.to_string(),
-            RepoType::Model,
-            "main".into(),
+            CHAT_REPO.to_string(), RepoType::Model, "main".into(),
         ));
         let model_path = repo.get(CHAT_FILE)?;
         println!("[chat] Carregando modelo...");
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::from_file(&model_path, model_params)?;
+        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)?;
         println!("[chat] Modelo carregado!");
-        Ok(Self { model, _backend: backend })
+        Ok(Self { model, backend })
     }
 
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096))
-            .with_n_batch(512);
-        let mut ctx = self.model.create_context(ctx_params)?;
+        let ctx_params = LlamaContextParams::default();
+        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
 
-        let tokens = self.model.str_to_token(prompt, AddBos::Always)?;
-        let mut batch = LlamaBatch::new(tokens.clone(), 0, 1);
-        ctx.encode(&mut batch, true)?;
+        let tokens_list = self.model.str_to_token(prompt, AddBos::Always)?;
 
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::temp(0.6)]);
-        let mut all_tokens: Vec<i32> = tokens.to_vec();
+        let mut batch = LlamaBatch::new(512, 1);
+        let last_index = tokens_list.len() as i32 - 1;
+        for (i, token) in (0_i32..).zip(tokens_list.iter().copied()) {
+            let is_last = i == last_index;
+            batch.add(token, i, &[0], is_last)?;
+        }
+        ctx.decode(&mut batch)?;
 
-        let mut next_token = ctx.sample(&mut sampler, Some(&all_tokens))?;
-        all_tokens.push(next_token);
-
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut sampler = LlamaSampler::greedy();
         let eos = self.model.token_eos();
         let mut response = String::new();
+        let mut n_cur: i32 = batch.n_tokens();
 
         for _ in 0..max_tokens {
-            if next_token == eos {
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
+            if token == eos {
                 break;
             }
-            if let Ok(text) = self.model.token_to_str(next_token) {
+            if let Ok(text) = self.model.token_to_piece(token, &mut decoder, true, None) {
                 response.push_str(&text);
                 print!("{text}");
                 std::io::stdout().flush()?;
             }
-            let mut batch = LlamaBatch::new(&[next_token], all_tokens.len() as i32 - 1, 1);
-            ctx.encode(&mut batch, false)?;
-            next_token = ctx.sample(&mut sampler, Some(&all_tokens))?;
-            all_tokens.push(next_token);
+            batch.clear();
+            batch.add(token, n_cur, &[0], true)?;
+            n_cur += 1;
+            ctx.decode(&mut batch)?;
         }
         Ok(response)
     }
@@ -153,30 +152,17 @@ impl VectorDB {
     fn search(&self, query_emb: &[f32], k: usize) -> Result<Vec<(i64, String, f64)>> {
         let mut stmt = self.conn.prepare("SELECT id, texto, embedding FROM docs")?;
         let rows: Vec<(i64, String, Vec<u8>)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?
+            .filter_map(|r| r.ok()).collect();
 
-        let mut results: Vec<(i64, String, f64)> = rows
-            .into_iter()
-            .map(|(id, texto, blob)| {
-                let emb: Vec<f32> = blob
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                let dot: f64 = query_emb.iter().zip(emb.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
-                let na: f64 = query_emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-                let nb: f64 = emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-                let dist = if na == 0.0 || nb == 0.0 { 1.0 } else { 1.0 - (dot / (na * nb)) };
-                (id, texto, dist)
-            })
-            .collect();
+        let mut results: Vec<(i64, String, f64)> = rows.into_iter().map(|(id, texto, blob)| {
+            let emb: Vec<f32> = blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let dot: f64 = query_emb.iter().zip(emb.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+            let na: f64 = query_emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let dist = if na == 0.0 || nb == 0.0 { 1.0 } else { 1.0 - (dot / (na * nb)) };
+            (id, texto, dist)
+        }).collect();
 
         results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
@@ -191,7 +177,6 @@ impl VectorDB {
 
 fn main() -> Result<()> {
     let sep = "=".repeat(55);
-
     println!("{sep}");
     println!("  STACK ULTRA-LEVE: Rust + candle + llama-cpp + rusqlite");
     println!("  Embedding: {EMBED_MODEL}");
@@ -215,7 +200,6 @@ fn main() -> Result<()> {
         "Machine learning permite que maquinas aprendam",
         "SQLite e um banco de dados leve e portatil",
     ];
-
     for doc in &docs {
         let emb = embed_engine.embed_vec(doc)?;
         db.insert(doc, &emb)?;
@@ -226,13 +210,11 @@ fn main() -> Result<()> {
     println!("{sep}");
     println!("  TESTE DE BUSCA SEMANTICA");
     println!("{sep}");
-
     let queries = vec![
         "qual animal de estimacao e mais leal?",
         "linguagem para programar",
         "banco de dados leve",
     ];
-
     for query in &queries {
         println!("\n  Busca: '{query}'");
         let qemb = embed_engine.embed_vec(query)?;
@@ -246,7 +228,6 @@ fn main() -> Result<()> {
     println!("\n{sep}");
     println!("  TESTE RAG (CHAT COM CONTEXTO)");
     println!("{sep}");
-
     let pergunta = "Qual animal e mais leal?";
     println!("\nPergunta: {pergunta}");
 
@@ -269,6 +250,5 @@ fn main() -> Result<()> {
     println!("\n{sep}");
     println!("  STACK FUNCIONANDO!");
     println!("{sep}");
-
     Ok(())
 }
