@@ -44,12 +44,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-${{ matrix.target }}-v2-
 
       - name: Build release
-        run: ${{ matrix.llama_flags }} RUSTFLAGS="${{ matrix.rustflags }}" cargo build --release --target ${{ matrix.target }}
+        run: |
+          echo "RUSTFLAGS=${{ matrix.rustflags }}"
+          echo "LLAMA_NO_AVX=$LLAMA_NO_AVX"
+          ${{ matrix.llama_flags }} RUSTFLAGS="${{ matrix.rustflags }}" cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
