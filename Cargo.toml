@@ -7,6 +7,7 @@ edition = "2021"
 candle-core = "0.8"
 candle-nn = "0.8"
 candle-transformers = "0.8"
+llama-cpp-2 = "0.1"
 tokenizers = "0.21"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,15 +1,22 @@
+use std::io::Write;
+use std::num::NonZeroU32;
+
 use anyhow::{Error as E, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
 use tokenizers::Tokenizer;
 
 const EMBED_MODEL: &str = "BAAI/bge-small-en-v1.5";
-
-// ============================================================
-// Embedding Engine — BERT via candle
-// ============================================================
+const CHAT_REPO: &str = "MaziyarPanahi/Qwen3-0.6B-GGUF";
+const CHAT_FILE: &str = "Qwen3-0.6B-Q4_K_M.gguf";
 
 struct EmbeddingEngine {
     model: BertModel,
@@ -20,65 +27,102 @@ struct EmbeddingEngine {
 impl EmbeddingEngine {
     fn new() -> Result<Self> {
         let device = Device::Cpu;
-        let repo = Repo::with_revision(EMBED_MODEL.to_string(), RepoType::Model, "main".to_string());
-
         let api = Api::new()?;
-        let api = api.repo(repo);
-
+        let repo = api.repo(Repo::with_revision(
+            EMBED_MODEL.to_string(),
+            RepoType::Model,
+            "main".into(),
+        ));
         println!("[embed] Baixando tokenizer...");
-        let tokenizer_path = api.get("tokenizer.json")?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(E::msg)?;
-
-        println!("[embed] Baixando config.json...");
-        let config_path = api.get("config.json")?;
-        let config_str = std::fs::read_to_string(&config_path)?;
-        let mut config: Config = serde_json::from_str(&config_str)?;
+        let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
+        println!("[embed] Baixando config...");
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
+        let mut config = config;
         config.hidden_act = HiddenAct::GeluApproximate;
-
-        println!("[embed] Baixando pesos (model.safetensors)...");
-        let weights_path = api.get("model.safetensors")?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)? };
-
+        println!("[embed] Baixando pesos...");
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[repo.get("model.safetensors")?], DTYPE, &device)?
+        };
         let model = BertModel::load(vb, &config)?;
-
         Ok(Self { model, tokenizer, device })
     }
 
-    fn embed(&self, text: &str) -> Result<Tensor> {
-        let tokens = self.tokenizer
-            .encode(text, true)
-            .map_err(|e| E::msg(format!("Tokenize error: {e}")))?;
-        let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
-        let token_type_ids = Tensor::new(tokens.get_type_ids(), &self.device)?.unsqueeze(0)?;
-        let attention_mask = Tensor::new(tokens.get_attention_mask(), &self.device)?.unsqueeze(0)?;
-
-        let embeddings = self.model.forward(&token_ids, &token_type_ids, Some(&attention_mask))?;
-
-        // Mean pooling (como sentence-transformers)
-        let attention_mask_for_pooling = attention_mask.to_dtype(DTYPE)?.unsqueeze(2)?;
-        let sum_mask = attention_mask_for_pooling.sum(1)?;
-        let pooled = (embeddings.broadcast_mul(&attention_mask_for_pooling)?).sum(1)?;
-        let pooled = pooled.broadcast_div(&sum_mask)?;
-
-        // L2 normalize
-        let norm = pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
-        let normalized = pooled.broadcast_div(&norm)?;
-
-        // Remove batch dimension: [1, hidden] -> [hidden]
-        let normalized = normalized.squeeze(0)?;
-
-        Ok(normalized)
-    }
-
     fn embed_vec(&self, text: &str) -> Result<Vec<f32>> {
-        let tensor = self.embed(text)?;
-        Ok(tensor.to_vec1()?)
+        let tokens = self.tokenizer.encode(text, true).map_err(E::msg)?;
+        let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
+        let type_ids = Tensor::new(tokens.get_type_ids(), &self.device)?.unsqueeze(0)?;
+        let mask = Tensor::new(tokens.get_attention_mask(), &self.device)?.unsqueeze(0)?;
+        let emb = self.model.forward(&token_ids, &type_ids, Some(&mask))?;
+        let mask_2d = mask.to_dtype(DTYPE)?.unsqueeze(2)?;
+        let pooled = (emb.broadcast_mul(&mask_2d)?)
+            .sum(1)?
+            .broadcast_div(&mask_2d.sum(1)?)?;
+        let norm = pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
+        let normalized = pooled.broadcast_div(&norm)?.squeeze(0)?;
+        normalized.to_vec1()
     }
 }
 
-// ============================================================
-// Vector DB — rusqlite (busca cosine manual)
-// ============================================================
+struct ChatEngine {
+    model: LlamaModel,
+    _backend: LlamaBackend,
+}
+
+impl ChatEngine {
+    fn new() -> Result<Self> {
+        let backend = LlamaBackend::init()?;
+        println!("[chat] Baixando modelo GGUF...");
+        let api = Api::new()?;
+        let repo = api.repo(Repo::with_revision(
+            CHAT_REPO.to_string(),
+            RepoType::Model,
+            "main".into(),
+        ));
+        let model_path = repo.get(CHAT_FILE)?;
+        println!("[chat] Carregando modelo...");
+        let model_params = LlamaModelParams::default();
+        let model = LlamaModel::from_file(&model_path, model_params)?;
+        println!("[chat] Modelo carregado!");
+        Ok(Self { model, _backend: backend })
+    }
+
+    fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(4096))
+            .with_n_batch(512);
+        let mut ctx = self.model.create_context(ctx_params)?;
+
+        let tokens = self.model.str_to_token(prompt, AddBos::Always)?;
+        let mut batch = LlamaBatch::new(tokens.clone(), 0, 1);
+        ctx.encode(&mut batch, true)?;
+
+        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::temp(0.6)]);
+        let mut all_tokens: Vec<i32> = tokens.to_vec();
+
+        let mut next_token = ctx.sample(&mut sampler, Some(&all_tokens))?;
+        all_tokens.push(next_token);
+
+        let eos = self.model.token_eos();
+        let mut response = String::new();
+
+        for _ in 0..max_tokens {
+            if next_token == eos {
+                break;
+            }
+            if let Ok(text) = self.model.token_to_str(next_token) {
+                response.push_str(&text);
+                print!("{text}");
+                std::io::stdout().flush()?;
+            }
+            let mut batch = LlamaBatch::new(&[next_token], all_tokens.len() as i32 - 1, 1);
+            ctx.encode(&mut batch, false)?;
+            next_token = ctx.sample(&mut sampler, Some(&all_tokens))?;
+            all_tokens.push(next_token);
+        }
+        Ok(response)
+    }
+}
 
 struct VectorDB {
     conn: rusqlite::Connection,
@@ -98,7 +142,7 @@ impl VectorDB {
     }
 
     fn insert(&self, texto: &str, embedding: &[f32]) -> Result<i64> {
-        let blob = f32_slice_to_bytes(embedding);
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.conn.execute(
             "INSERT INTO docs (texto, embedding) VALUES (?1, ?2)",
             rusqlite::params![texto, blob],
@@ -108,7 +152,6 @@ impl VectorDB {
 
     fn search(&self, query_emb: &[f32], k: usize) -> Result<Vec<(i64, String, f64)>> {
         let mut stmt = self.conn.prepare("SELECT id, texto, embedding FROM docs")?;
-
         let rows: Vec<(i64, String, Vec<u8>)> = stmt
             .query_map([], |row| {
                 Ok((
@@ -123,8 +166,14 @@ impl VectorDB {
         let mut results: Vec<(i64, String, f64)> = rows
             .into_iter()
             .map(|(id, texto, blob)| {
-                let emb = bytes_to_f32_slice(&blob);
-                let dist = cosine_distance(query_emb, &emb);
+                let emb: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let dot: f64 = query_emb.iter().zip(emb.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+                let na: f64 = query_emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                let nb: f64 = emb.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                let dist = if na == 0.0 || nb == 0.0 { 1.0 } else { 1.0 - (dot / (na * nb)) };
                 (id, texto, dist)
             })
             .collect();
@@ -135,60 +184,36 @@ impl VectorDB {
     }
 
     fn count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM docs", [], |row| row.get(0))?;
-        Ok(count as usize)
+        let c: i64 = self.conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get(0))?;
+        Ok(c as usize)
     }
 }
-
-fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
-    slice.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
-    let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 1.0;
-    }
-    1.0 - (dot / (norm_a * norm_b))
-}
-
-// ============================================================
-// Main
-// ============================================================
 
 fn main() -> Result<()> {
     let sep = "=".repeat(55);
 
     println!("{sep}");
-    println!("  STACK ULTRA-LEVE: Rust + candle + rusqlite");
+    println!("  STACK ULTRA-LEVE: Rust + candle + llama-cpp + rusqlite");
     println!("  Embedding: {EMBED_MODEL}");
+    println!("  Chat: Qwen3-0.6B GGUF Q4_K_M");
     println!("{sep}\n");
 
-    // 1. Embedding engine
     let embed_engine = EmbeddingEngine::new()?;
     println!("[ok] Embedding engine pronto\n");
 
-    // 2. Vector DB
-    let db = VectorDB::new_in_memory()?;
-    println!("[ok] VectorDB pronta (in-memory)\n");
+    let chat_engine = ChatEngine::new()?;
+    println!("[ok] Chat engine pronto\n");
 
-    // 3. Inserir documentos
+    let db = VectorDB::new_in_memory()?;
+    println!("[ok] VectorDB pronta\n");
+
     println!("Inserindo documentos...");
     let docs = vec![
-        "O gato é um animal doméstico popular",
-        "O cachorro é o melhor amigo do homem",
-        "Python é uma linguagem de programação versátil",
-        "Machine learning permite que máquinas aprendam",
-        "SQLite é um banco de dados leve e portátil",
+        "O gato e um animal domestico popular",
+        "O cachorro e o melhor amigo do homem",
+        "Python e uma linguagem de programacao versatil",
+        "Machine learning permite que maquinas aprendam",
+        "SQLite e um banco de dados leve e portatil",
     ];
 
     for doc in &docs {
@@ -198,13 +223,12 @@ fn main() -> Result<()> {
     }
     println!("\nTotal: {} documentos inseridos\n", db.count()?);
 
-    // 4. Busca semântica
     println!("{sep}");
-    println!("  TESTE DE BUSCA SEMÂNTICA");
+    println!("  TESTE DE BUSCA SEMANTICA");
     println!("{sep}");
 
     let queries = vec![
-        "qual animal de estimação é mais leal?",
+        "qual animal de estimacao e mais leal?",
         "linguagem para programar",
         "banco de dados leve",
     ];
@@ -220,7 +244,30 @@ fn main() -> Result<()> {
     }
 
     println!("\n{sep}");
-    println!("  STACK FUNCIONANDO! Zero dependência Python.");
+    println!("  TESTE RAG (CHAT COM CONTEXTO)");
+    println!("{sep}");
+
+    let pergunta = "Qual animal e mais leal?";
+    println!("\nPergunta: {pergunta}");
+
+    let qemb = embed_engine.embed_vec(pergunta)?;
+    let results = db.search(&qemb, 1)?;
+    let contexto = if let Some((_, ref texto, _)) = results.first() {
+        texto.clone()
+    } else {
+        String::new()
+    };
+    println!("Contexto encontrado: {contexto}");
+
+    let prompt = format!(
+        "<|im_start|>user\nResponda em portugues com base no contexto.\nContexto: {contexto}\nPergunta: {pergunta}\n<|im_end|>\n<|im_start|>assistant\n"
+    );
+    println!("\nPrompt enviado ao modelo...\n");
+    let resposta = chat_engine.generate(&prompt, 100)?;
+    println!("\nResposta: {resposta}");
+
+    println!("\n{sep}");
+    println!("  STACK FUNCIONANDO!");
     println!("{sep}");
 
     Ok(())
