@@ -4,7 +4,6 @@ use anyhow::{Error as E, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
-use encoding_rs::Encoding;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -58,7 +57,7 @@ impl EmbeddingEngine {
             .broadcast_div(&mask_2d.sum(1)?)?;
         let norm = pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
         let normalized = pooled.broadcast_div(&norm)?.squeeze(0)?;
-        normalized.to_vec1()
+        Ok(normalized.to_vec1()?)
     }
 }
 
