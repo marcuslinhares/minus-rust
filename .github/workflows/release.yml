@@ -21,6 +21,7 @@ jobs:
             os: ubuntu-latest
             artifact: minus-linux-x64
             rustflags: -C target-cpu=x86-64-v2
+            llama_flags: LLAMA_NO_AVX=1 LLAMA_NO_AVX2=1 LLAMA_NO_FMA=1
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: minus-macos-x64
@@ -48,7 +49,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
       - name: Build release
-        run: RUSTFLAGS="${{ matrix.rustflags }}" cargo build --release --target ${{ matrix.target }}
+        run: ${{ matrix.llama_flags }} RUSTFLAGS="${{ matrix.rustflags }}" cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
